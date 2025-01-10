@@ -67,8 +67,8 @@ VECTORSTORE_DIR=your-vector-store-dir
 The defaults values for `response_model`, `query_model` are shown below:
 
 ```yaml
-response_model: openai/gpt-3.5-turbo-0125
-query_model: openai/gpt-3.5-turbo-0125
+response_model: openai/gpt-4o-mini
+query_model: openai/gpt-4o-mini
 ```
 
 Follow the instructions below to get set up, or pick one of the additional options.
