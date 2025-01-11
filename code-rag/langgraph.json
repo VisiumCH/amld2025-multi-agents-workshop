@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "code": "./src/script.py:app"
+  },
+  "env": ".env"
+}
