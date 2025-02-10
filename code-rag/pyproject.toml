@@ -7,12 +7,13 @@ authors = [
     { name = "Gregoire Clement", email = "gregoire.clement@visium.ch" },
 ]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
-    "langgraph>=0.2.6",
+    "langgraph>=0.2.69",
     "langchain>=0.2.14",
     "langchain-community>=0.0.24",
     "langchain-openai>=0.1.22",
+    "langchain-chroma>=0.1.2",
     "python-dotenv>=1.0.1",
     "msgspec>=0.18.6",
     "beautifulsoup4>=4.12.0",
@@ -36,7 +37,10 @@ packages = ["code_rag_graph"]
 "*" = ["py.typed"]
 
 [tool.ruff]
-lint.select = [
+line-length = 120
+
+[tool.ruff.lint]
+select = [
     "E",    # pycodestyle
     "F",    # pyflakes
     "I",    # isort
@@ -45,20 +49,7 @@ lint.select = [
     "T201",
     "UP",
 ]
-lint.ignore = [
-    "UP006",
-    "UP007",
-    # We actually do want to import from typing_extensions
-    "UP035",
-    # Relax the convention by _not_ requiring documentation for every function parameter.
-    "D417",
-    "E501",
-]
-[tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D", "UP"]
-[tool.ruff.lint.pydocstyle]
-convention = "google"
+pydocstyle = { convention = "google" }
+
 [tool.pytest.ini_options]
-pythonpath = [
-  "src"
-]
+pythonpath = ["src"]
