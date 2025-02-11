@@ -8,306 +8,327 @@ from typing import Annotated, Literal, cast
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, SystemMessagePromptTemplate
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-# Ensure API key is set.
+# -----------------------------------------------------------------------------
+# Environment and Global Configuration
+# -----------------------------------------------------------------------------
+
 if not os.environ.get("OPENAI_API_KEY"):
     raise ValueError("Please set OPENAI_API_KEY environment variable")
 
-MAX_ITERATIONS = 3
+# Workflow Configuration
+MAX_ITERATIONS = 10
+RETRIEVAL_K = 2
+LLM_MODEL = "gpt-4o-mini"
+LLM_TEMPERATURE = 0
 
-# %%
-# --- Document loading & retrieval setup ---
-docs = pickle.load(open("docs.pkl", "rb"))
+# -----------------------------------------------------------------------------
+# Utility Functions for Document Handling
+# -----------------------------------------------------------------------------
 
 
-def split_docs(docs_list: list[Document]) -> list[Document]:
+def load_documents(pickle_filepath: str = "docs.pkl") -> list[Document]:
+    """Load documents from a pickle file."""
+    with open(pickle_filepath, "rb") as file:
+        return pickle.load(file)
+
+
+def split_documents(documents: list[Document]) -> list[Document]:
+    """Split each document into chunks using a recursive text splitter."""
     splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
         chunk_size=300, chunk_overlap=100, disallowed_special=()
     )
-    return splitter.split_documents(docs_list)
+    return splitter.split_documents(documents)
 
 
-def create_vstore(docs_splits: list[Document]) -> Chroma:
+def initialize_vector_store(document_chunks: list[Document]) -> Chroma:
+    """Reset the Chroma collection and initialize a vector store using document chunks."""
     Chroma().reset_collection()
-
     embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
-    return Chroma.from_documents(documents=docs_splits, embedding=embedding_model)
+    return Chroma.from_documents(documents=document_chunks, embedding=embedding_model)
 
 
-def reduce_docs(docs_list: list[Document]) -> list[Document]:
-    seen = set()
-    unique = []
-    for doc in docs_list:
-        if doc.id not in seen:
-            seen.add(doc.page_content)
-            unique.append(doc)
-    return unique
+def deduplicate_documents(documents: list[Document]) -> list[Document]:
+    """Remove duplicate documents based on their unique identifier."""
+    unique_docs = {doc.id: doc for doc in documents}
+    return list(unique_docs.values())
 
 
-# %%
-docs_splits = split_docs(docs[:10])
+# -----------------------------------------------------------------------------
+# Document Preparation and Retriever Setup
+# -----------------------------------------------------------------------------
 
-# %%
-vstore = create_vstore(docs_splits)
+# For demonstration, load and process a subset of documents.
+loaded_documents = load_documents("docs.pkl")
+chunked_documents = split_documents(loaded_documents)
 
-# %%
-retriever = vstore.as_retriever(search_kwargs={"k": 2})
+# Initialize vector store and create a retriever.
+vector_store = initialize_vector_store(chunked_documents)
+retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_K})
 
-
-# --- Schema for structured code generation ---
-
-
-class Code(BaseModel):
-    prefix: str = Field(description="A description of the problem and proposed approach.")
-    code: str = Field(description="The python code block. It should be runnable and solve the problem.")
-
-
-class DecisionSchema(BaseModel):
-    prefix: str = Field(description="A description of the the decision process.")
-    route: Literal["generate", "retrieve"] = Field(description="The decision to generate or retrieve.")
-    retrieval_query: str | None = Field(description="The query for retrieving additional documentation.")
+# -----------------------------------------------------------------------------
+# Structured Output Schemas for the Workflow
+# -----------------------------------------------------------------------------
 
 
-# --- State Definitions ---
+class RetrievalDecision(BaseModel):
+    """Retrieval decision to either fetch more docs or generate a solution."""
+
+    rationale: str = Field(description="Explanation for the decision")
+    decision: Literal["generation", "retrieval"] = Field(
+        description="Indicates whether to generate a solution or retrieve docs"
+    )
+    retrieval_query: str | None = Field(description="Query to retrieve additional documentation, if needed")
+
+
+class GeneratedSolution(BaseModel):
+    """Generated solution with rationale and code."""
+
+    rationale: str = Field(description="Explanation of the solution approach")
+    code: str = Field(description="The complete Python code solution")
+
+
+class ReviewDecision(BaseModel):
+    """Review outcome indicating if the solution is accepted or needs revision."""
+
+    rationale: str = Field(description="Feedback explaining the review decision")
+    decision: Literal["revise", "accept"] = Field(description="Indicates whether to revise or accept the solution")
+
+
+# -----------------------------------------------------------------------------
+# RAG Workflow State Definition
+# -----------------------------------------------------------------------------
 
 
 @dataclass(kw_only=True)
-class AgentState:
-    messages: Annotated[list[str], add_messages] = field(default_factory=list)
+class GraphState:
+    """Workflow state: messages, query, docs, solution, and iteration count."""
+
+    messages: Annotated[list[BaseMessage], add_messages] = field(default_factory=list)
     retrieval_query: str | None = field(default=None)
-    documents: list[Document] = field(default_factory=list)
+    retrieved_documents: list[Document] = field(default_factory=list)
+    generated_solution: str | None = field(default=None)
     iterations: int = field(default=0)
 
 
-# --- Workflow Nodes using Command ---
+# -----------------------------------------------------------------------------
+# System Prompts
+# -----------------------------------------------------------------------------
+
+RETRIEVAL_DECISION_PROMPT = """
+You are a Retrieval Decision Agent in a LangGraph Retrieval-Augmented Generation system with access to a large corpus of LangGraph documentation in a vector store.
+
+Your role is to determine if the information at hand is sufficient to generate a code solution, or if further documentation must be retrieved.
+
+The latest retrieval query is:
+{retrieval_query}
+
+and the retrieved documentation is:
+{documentation}
+
+Carefully assess whether whether the available context is sufficient for generating a LangGraph solution to the user request.
+
+If you perceive that crucial details are missing, you should return 'retrieval' along with a retrieval query to prompt further data retrieval. Otherwise, return 'generation' to proceed with the code generation phase.
+
+Include a brief rationale explaining your decision.
+"""
+
+SOLUTION_GENERATION_PROMPT = """
+You are a Generation Agent in a LangGraph code generation workflow. Your task is to produce a Python solution that implements the requested LangGraph workflow.
+
+The current documentation available for generating the solution is:
+{documentation}
+
+Based on your expertise, the documentation, and the current dialogue context, craft a Python code solution that effectively addresses the user request.
+
+Your solution should be clear, concise, and well-structured, ensuring that it is both functional and adheres to best practices.
+
+Return a rationale explaining your solution approach along with the complete Python code solution.
+"""
+
+SOLUTION_REVIEW_PROMPT = """
+You are a Review Agent in a LangGraph code generation workflow. Your role is to evaluate the generated Python solution and determine if it meets the user's request and the LangGraph standards.
+
+Review the dialogue context to assess that the proposed solution is technically sound, adheres to LangGraph best practices and fulfills the user's requirements.
+
+If the solution meets the standards of a reliable LangGraph implementation, confirm its acceptance with 'accept'.
+
+Otherwise, prompt further refinement by returning 'revise' along with your rationale for the necessary changes.
+
+Your rationale should provide constructive and well justified feedback to guide the revision process.
+"""
 
 
-# --- Retrieve Node ---
-def retrieve_node(state: AgentState) -> Command[Literal["generate"]]:
-    print(f"Retrieving documents for query: {state.retrieval_query}")
-    docs_found = retriever.invoke(state.retrieval_query)
+# -----------------------------------------------------------------------------
+# Workflow Node Implementations
+# -----------------------------------------------------------------------------
 
+# ----- Retrieval Node -----
+
+
+def retrieval_node(state: GraphState) -> Command[Literal["generation"]]:
+    """Retrieve documentation based on the current retrieval query."""
+    assert state.retrieval_query, "No retrieval query provided."
+    retrieved_docs = retriever.invoke(state.retrieval_query)
     return Command(
-        goto="generate",
-        update={
-            "documents": docs_found,
-        },
+        goto="generation",
+        update={"retrieved_documents": retrieved_docs},
     )
 
 
-# --- Decision Node ---
+# ----- Retrieval Decision Node -----
 
-
-DECISION_PROMPT = """
-
-You are a smart decision maker. You have access to a vector database containing the latest LangGraph documentation.
-
-Based on the conversation, any error messages, and the current code solution (if any), decide whether documentation should be retrieved or if the system should generate a solution right away.
-
-If you think additional documentation is needed, respond with 'retrieve' and provide a retrieval query to search for more information.
-
-If you think a solution can be generated based on the current context, respond with 'generate'.
-
-Previously, you made the following query:
-
-<retrieval_query>
-{retrieval_query}
-</retrieval_query>
-
-This returned the following documents:
-
-<documentation>
-{documentation}
-</documentation>
-
-"""
-
-decision_prompt = ChatPromptTemplate.from_messages(
+retrieval_decision_prompt_template = ChatPromptTemplate.from_messages(
     [
-        SystemMessagePromptTemplate.from_template(DECISION_PROMPT),
+        SystemMessagePromptTemplate.from_template(RETRIEVAL_DECISION_PROMPT),
         MessagesPlaceholder("messages"),
     ]
 )
-decision_model = ChatOpenAI(temperature=0, model="gpt-4o").with_structured_output(DecisionSchema)
-decision_chain = decision_prompt | decision_model
+retrieval_decision_model = ChatOpenAI(temperature=LLM_TEMPERATURE, model=LLM_MODEL).with_structured_output(
+    RetrievalDecision
+)
+retrieval_decision_chain = retrieval_decision_prompt_template | retrieval_decision_model
 
 
-def decision_node(state: AgentState) -> Command[Literal["generate", "retrieve", END]]:
+def retrieval_decision_node(state: GraphState) -> Command[Literal["generation", "retrieval", END]]:
+    """Decide to generate a solution or retrieve more documentation, with iteration limit enforcement."""
+    # Enforce the maximum iterations limit.
     if state.iterations >= MAX_ITERATIONS:
-        return Command(goto=END)
+        return Command(
+            goto=END,
+            update={
+                "messages": AIMessage("Maximum iteration limit reached. Finalizing workflow."),
+            },
+        )
 
-    print(f"Decision node with {len(state.documents)} documents.")
-    documentation = "\n".join(doc.page_content for doc in state.documents)
+    documentation = "\n".join(doc.page_content for doc in state.retrieved_documents) or None
 
-    print(state.retrieval_query)
-
-    decision_value = decision_chain.invoke(
+    retrieval_decision = retrieval_decision_chain.invoke(
         {
             "retrieval_query": state.retrieval_query,
             "documentation": documentation,
             "messages": state.messages,
         }
     )
+    retrieval_decision = cast(RetrievalDecision, retrieval_decision)
 
-    decision_value = cast(DecisionSchema, decision_value)  # TODO: repetition but avoids linting warnings
-
-    print(f"Decision: {decision_value.route}")
-    print(f"Prefix: {decision_value.prefix}")
-
-    if decision_value.route == "retrieve":
-        print(f"Retrieval query: {decision_value.retrieval_query}")
+    if retrieval_decision.decision == "retrieval":
         return Command(
-            goto="retrieve",
-            update={"retrieval_query": decision_value.retrieval_query},
+            goto="retrieval",
+            update={
+                "retrieval_query": retrieval_decision.retrieval_query,
+            },
         )
-    else:  # decision_value.route == "generate":
-        return Command(
-            goto="generate",
-        )
+    else:
+        return Command(goto="generation")
 
 
-# --- Code Generation Node ---
+# ----- Generation Node -----
 
-
-GENERATION_PROMPT = """
-
-You are a coding assistant with expertise in LangChain and LangGraph. You are tasked with generating a code solution based on the provided documentation.
-
-You should ouput a runnable code solution with imports that solves the problem described in the documentation.
-
-<documentation>
-{documentation}
-</documentation>
-
-"""
-
-code_gen_prompt = ChatPromptTemplate.from_messages(
+generation_prompt_template = ChatPromptTemplate.from_messages(
     [
-        SystemMessagePromptTemplate.from_template(GENERATION_PROMPT),
+        SystemMessagePromptTemplate.from_template(SOLUTION_GENERATION_PROMPT),
         MessagesPlaceholder("messages"),
     ]
 )
-code_gen_model = ChatOpenAI(temperature=0, model="gpt-4o").with_structured_output(Code)
-code_gen_chain = code_gen_prompt | code_gen_model
+generation_model = ChatOpenAI(temperature=LLM_TEMPERATURE, model=LLM_MODEL).with_structured_output(GeneratedSolution)
+generation_chain = generation_prompt_template | generation_model
 
 
-def generate_node(state: AgentState) -> Command[Literal["test"]]:
-    print(f"Generating code solution with {len(state.documents)} documents.")
-    documentation = "\n".join(doc.page_content for doc in state.documents)
-
-    code_solution = code_gen_chain.invoke(
+def generation_node(state: GraphState) -> Command[Literal["testing"]]:
+    """Generate a Python code solution based on the current enriched context."""
+    documentation_summary = "\n".join(doc.page_content for doc in state.retrieved_documents)
+    solution_output = generation_chain.invoke(
         {
-            "documentation": documentation,
+            "documentation": documentation_summary,
             "messages": state.messages,
-        },
+        }
     )
-
-    code_solution = cast(Code, code_solution)  # TODO: repetition but avoids linting warnings
-
+    solution_output = cast(GeneratedSolution, solution_output)
     return Command(
-        goto="test",
+        goto="testing",
         update={
-            "messages": AIMessage(code_solution.code),
+            "generated_solution": solution_output.code,
+            "messages": AIMessage(solution_output.code),
             "iterations": state.iterations + 1,
         },
     )
 
 
-def test_node(state: AgentState) -> Command[Literal["decision", "critique", END]]:
-    print(f"Testing code solution with {len(state.documents)} documents.")
+# ----- Testing Node -----
 
-    code = state.messages[-1]
+
+def testing_node(state: GraphState) -> Command[Literal["retrieval_decision", "review", END]]:
+    """Test the generated solution by executing the code."""
+    code = state.generated_solution
+    assert code, "No code solution provided."
 
     try:
-        exec(code)
-    except Exception as e:
+        # exec_globals: dict = {}
+        exec(code)  # , exec_globals)
+    except Exception as error:
+        error_message = f"Code execution failed: {error}"
         return Command(
-            goto="decision",
-            update={
-                "messages": HumanMessage(f"Code execution failed: {e}"),
-            },
+            goto="retrieval_decision",
+            update={"messages": HumanMessage(error_message)},
         )
 
+    success_message = "Code execution successful."
     return Command(
-        goto="critique",
-        update={
-            "messages": "Code execution successful.",
-        },
+        goto="review",
+        update={"messages": HumanMessage(success_message)},
     )
 
 
-@dataclass(kw_only=True)
-class CritiqueSchema(BaseModel):
-    decision: Literal["decision", "end"] = Field(description="The critique decision.")
-    critique: str = Field(description="The critique feedback.")
+# ----- Review Node -----
 
-
-CRITIQUE_PROMPT = """
-    You are a critique assistant. Based on the provided messages and context, critique the generated code solution.
-
-    Give suggestions to the code generator for improvement and provide feedback on the code quality.
-
-    You must decide whether the code solution is acceptable or if it needs improvement to conform to the user request.
-
-    Don't be to strict, we are aiming for a quick solution, but make sure it is correct.
-
-    If you think the solution is acceptable, respond with 'end'.
-
-    If you think the solution must be improved to better fit the user request, respond with 'decision' and provide feedback on the code.
-
-"""
-
-critique_prompt = ChatPromptTemplate.from_messages(
+review_prompt_template = ChatPromptTemplate.from_messages(
     [
-        SystemMessagePromptTemplate.from_template(CRITIQUE_PROMPT),
+        SystemMessagePromptTemplate.from_template(SOLUTION_REVIEW_PROMPT),
         MessagesPlaceholder("messages"),
     ]
 )
-critique_model = ChatOpenAI(temperature=0, model="gpt-4o").with_structured_output(CritiqueSchema)
-critique_chain = critique_prompt | critique_model
+review_model = ChatOpenAI(temperature=LLM_TEMPERATURE, model=LLM_MODEL).with_structured_output(ReviewDecision)
+review_chain = review_prompt_template | review_model
 
 
-def critique_node(state: AgentState) -> Command[Literal["decision", END]]:
-    critique_response = critique_chain.invoke({"messages": state.messages})
-
-    critique_response = cast(CritiqueSchema, critique_response)
-
-    if critique_response.decision == "end":
+def review_node(state: GraphState) -> Command[Literal["retrieval_decision", END]]:
+    """Review the generated solution and determine if it is acceptable."""
+    review_result = review_chain.invoke({"messages": state.messages})
+    review_result = cast(ReviewDecision, review_result)
+    if review_result.decision == "accept":
         return Command(goto=END)
     else:
         return Command(
-            goto="decision",
-            update={
-                "messages": HumanMessage(f"{critique_response.critique}"),
-            },
+            goto="retrieval_decision",
+            update={"messages": HumanMessage(review_result.rationale)},
         )
 
 
-# --- Workflow Setup ---
-def setup_workflow():
-    builder = StateGraph(AgentState)
-    builder.add_edge(START, "decision")
-    builder.add_node("decision", decision_node)
-    builder.add_node("generate", generate_node)
-    builder.add_node("test", test_node)
-    builder.add_node("critique", critique_node)
-    builder.add_node("retrieve", retrieve_node)
+# -----------------------------------------------------------------------------
+# Workflow Setup and Main Execution
+# -----------------------------------------------------------------------------
 
-    # Other edges are added dynamically based with Command objects!
 
-    return builder.compile()
+def setup_workflow() -> CompiledStateGraph:
+    """Set up and compile the state graph workflow."""
+    graph_builder = StateGraph(GraphState)
+    graph_builder.add_edge(START, "retrieval_decision")
+    graph_builder.add_node("retrieval_decision", retrieval_decision_node)
+    graph_builder.add_node("generation", generation_node)
+    graph_builder.add_node("testing", testing_node)
+    graph_builder.add_node("review", review_node)
+    graph_builder.add_node("retrieval", retrieval_node)
+    # Additional edges are added dynamically via Command objects.
+    return graph_builder.compile()
 
 
 app = setup_workflow()
-
-# --- Terminal run ---
-if __name__ == "__main__":
-    # --- Compile the Workflow ---
-    app.invoke({"messages": HumanMessage("Implement a simple RAG system in Langgraph")})
