@@ -1,0 +1,29 @@
+[project]
+name = "financial-advisor"
+version = "0.1.0"
+description = "Building a Financial Advisor with LangGraph: From GPT to RAG and Multi-Agent Systems"
+authors = [
+    { name = "Victor Gillioz", email = "victor.gillioz@visium.ch" },
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain>=0.2.14",
+    "langgraph>=0.2.69",
+    "langchain-openai>=0.1.22",
+    "langchain-chroma>=0.1.2",
+    "pydantic>=2.0.0",
+    "jupyter>=1.1.1",
+    "ipywidgets>=8.1.5",
+    "ipython>=8.32.0",
+]
+
+[project.optional-dependencies]
+dev = ["mypy>=1.15.0", "ruff>=0.9.6"]
+
+[build-system]
+requires = ["setuptools>=73.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+exclude = ["data/", "notebooks/"]
